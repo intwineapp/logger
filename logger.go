@@ -19,6 +19,7 @@ package logger
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"sync"
@@ -123,6 +124,11 @@ func Init(name string, verbose, systemLog bool, logFile io.Writer) *Logger {
 	}
 
 	return &l
+}
+
+// New return a default Logger
+func New() *Logger {
+	return Init("", true, false, ioutil.Discard)
 }
 
 // A Logger represents an active logging object. Multiple loggers can be used
