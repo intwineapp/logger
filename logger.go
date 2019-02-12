@@ -1,4 +1,5 @@
 /*
+Copyright 2018 Intwine Labs, Inc. All Rights Reserved.
 Copyright 2016 Google Inc. All Rights Reserved.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +23,14 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"runtime"
+	"strconv"
 	"sync"
+	"time"
+
+	"github.com/Microsoft/ApplicationInsights-Go/appinsights/contracts"
+
+	"github.com/Microsoft/ApplicationInsights-Go/appinsights"
 )
 
 type severity int
@@ -139,6 +147,9 @@ type Logger struct {
 	errorLog    *log.Logger
 	fatalLog    *log.Logger
 	closers     []io.Closer
+	client      appinsights.TelemetryClient
+	name        string
+	remoteLog   bool
 	initialized bool
 }
 
@@ -159,6 +170,36 @@ func (l *Logger) output(s severity, depth int, txt string) {
 	}
 }
 
+type Config struct {
+	Key              string
+	MaxBatchInterval time.Duration
+	MaxBatchSize     int
+}
+
+func (l *Logger) Config(conf Config) {
+	telemetryClientConfig := appinsights.NewTelemetryConfiguration(conf.Key)
+	if conf.MaxBatchInterval != 0 {
+		telemetryClientConfig.MaxBatchInterval = conf.MaxBatchInterval
+	} else {
+		telemetryClientConfig.MaxBatchInterval = 1 * time.Second
+	}
+	if conf.MaxBatchSize != 0 {
+		telemetryClientConfig.MaxBatchSize = conf.MaxBatchSize
+	} else {
+		telemetryClientConfig.MaxBatchSize = 1024
+	}
+	telemetryClient := appinsights.NewTelemetryClientFromConfig(telemetryClientConfig)
+	l.client = telemetryClient
+	l.remoteLog = true
+}
+
+// Flush flushes buffered logs
+func (l *Logger) Flush() {
+	if l.remoteLog {
+		l.client.Channel().Flush()
+	}
+}
+
 // Close closes all the underlying log writers, which will flush any cached logs.
 // Any errors from closing the underlying log writers will be printed to stderr.
 // Once Close is called, all future calls to the logger will panic.
@@ -170,84 +211,155 @@ func (l *Logger) Close() {
 			fmt.Fprintf(os.Stderr, "Failed to close log %v: %v\n", c, err)
 		}
 	}
+
+	if l.remoteLog {
+		l.Flush()
+		<-l.client.Channel().Close(10 * time.Second)
+	}
 }
 
 // Info logs with the Info severity.
 // Arguments are handled in the manner of fmt.Print.
 func (l *Logger) Info(v ...interface{}) {
 	l.output(sInfo, 0, fmt.Sprint(v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Information, v)
+	}
 }
 
 // InfoDepth acts as Info but uses depth to determine which call frame to log.
 // InfoDepth(0, "msg") is the same as Info("msg").
 func (l *Logger) InfoDepth(depth int, v ...interface{}) {
 	l.output(sInfo, depth, fmt.Sprint(v...))
+	if l.remoteLog {
+		l.emitUnstructured(depth, appinsights.Information, v)
+	}
 }
 
 // Infoln logs with the Info severity.
 // Arguments are handled in the manner of fmt.Println.
 func (l *Logger) Infoln(v ...interface{}) {
 	l.output(sInfo, 0, fmt.Sprintln(v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Information, v)
+	}
 }
 
 // Infof logs with the Info severity.
 // Arguments are handled in the manner of fmt.Printf.
 func (l *Logger) Infof(format string, v ...interface{}) {
 	l.output(sInfo, 0, fmt.Sprintf(format, v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Information, format, v)
+	}
+}
+
+// InfoWith logs with the Info severity.
+// Arguments are handled as structured key val pairs.
+func (l *Logger) InfoWith(format string, v ...interface{}) {
+	l.output(sInfo, 0, fmt.Sprintf(format, v...))
+	if l.remoteLog {
+		l.emitStructured(0, appinsights.Information, format, v)
+	}
 }
 
 // Warning logs with the Warning severity.
 // Arguments are handled in the manner of fmt.Print.
 func (l *Logger) Warning(v ...interface{}) {
 	l.output(sWarning, 0, fmt.Sprint(v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Warning, v)
+	}
 }
 
 // WarningDepth acts as Warning but uses depth to determine which call frame to log.
 // WarningDepth(0, "msg") is the same as Warning("msg").
 func (l *Logger) WarningDepth(depth int, v ...interface{}) {
 	l.output(sWarning, depth, fmt.Sprint(v...))
+	if l.remoteLog {
+		l.emitUnstructured(depth, appinsights.Warning, v)
+	}
 }
 
 // Warningln logs with the Warning severity.
 // Arguments are handled in the manner of fmt.Println.
 func (l *Logger) Warningln(v ...interface{}) {
 	l.output(sWarning, 0, fmt.Sprintln(v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Warning, v)
+	}
 }
 
 // Warningf logs with the Warning severity.
 // Arguments are handled in the manner of fmt.Printf.
 func (l *Logger) Warningf(format string, v ...interface{}) {
 	l.output(sWarning, 0, fmt.Sprintf(format, v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Warning, format, v)
+	}
+}
+
+// WarningWith logs with the Warning severity.
+// Arguments are handled as structured key val pairs.
+func (l *Logger) WarningWith(format string, v ...interface{}) {
+	l.output(sWarning, 0, fmt.Sprintf(format, v...))
+	if l.remoteLog {
+		l.emitStructured(0, appinsights.Warning, format, v)
+	}
 }
 
 // Error logs with the ERROR severity.
 // Arguments are handled in the manner of fmt.Print.
 func (l *Logger) Error(v ...interface{}) {
 	l.output(sError, 0, fmt.Sprint(v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Error, v)
+	}
 }
 
 // ErrorDepth acts as Error but uses depth to determine which call frame to log.
 // ErrorDepth(0, "msg") is the same as Error("msg").
 func (l *Logger) ErrorDepth(depth int, v ...interface{}) {
 	l.output(sError, depth, fmt.Sprint(v...))
+	if l.remoteLog {
+		l.emitUnstructured(depth, appinsights.Error, v)
+	}
 }
 
 // Errorln logs with the ERROR severity.
 // Arguments are handled in the manner of fmt.Println.
 func (l *Logger) Errorln(v ...interface{}) {
 	l.output(sError, 0, fmt.Sprintln(v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Error, v)
+	}
 }
 
 // Errorf logs with the Error severity.
 // Arguments are handled in the manner of fmt.Printf.
 func (l *Logger) Errorf(format string, v ...interface{}) {
 	l.output(sError, 0, fmt.Sprintf(format, v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Error, format, v)
+	}
+}
+
+// ErrorWith logs with the Error severity.
+// Arguments are handled as structured key val pairs.
+func (l *Logger) ErrorWith(format string, v ...interface{}) {
+	l.output(sError, 0, fmt.Sprintf(format, v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Error, format, v)
+	}
 }
 
 // Fatal logs with the Fatal severity, and ends with os.Exit(1).
 // Arguments are handled in the manner of fmt.Print.
 func (l *Logger) Fatal(v ...interface{}) {
 	l.output(sFatal, 0, fmt.Sprint(v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Error, v)
+	}
 	l.Close()
 	os.Exit(1)
 }
@@ -256,6 +368,9 @@ func (l *Logger) Fatal(v ...interface{}) {
 // FatalDepth(0, "msg") is the same as Fatal("msg").
 func (l *Logger) FatalDepth(depth int, v ...interface{}) {
 	l.output(sFatal, depth, fmt.Sprint(v...))
+	if l.remoteLog {
+		l.emitUnstructured(depth, appinsights.Error, v)
+	}
 	l.Close()
 	os.Exit(1)
 }
@@ -264,6 +379,9 @@ func (l *Logger) FatalDepth(depth int, v ...interface{}) {
 // Arguments are handled in the manner of fmt.Println.
 func (l *Logger) Fatalln(v ...interface{}) {
 	l.output(sFatal, 0, fmt.Sprintln(v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Error, v)
+	}
 	l.Close()
 	os.Exit(1)
 }
@@ -272,6 +390,20 @@ func (l *Logger) Fatalln(v ...interface{}) {
 // Arguments are handled in the manner of fmt.Printf.
 func (l *Logger) Fatalf(format string, v ...interface{}) {
 	l.output(sFatal, 0, fmt.Sprintf(format, v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Error, format, v)
+	}
+	l.Close()
+	os.Exit(1)
+}
+
+// FatalWith logs with the Fatal severity, and ends with os.Exit(1).
+// Arguments are handled as structured key val pairs.
+func (l *Logger) FatalWith(format string, v ...interface{}) {
+	l.output(sFatal, 0, fmt.Sprintf(format, v...))
+	if l.remoteLog {
+		l.emitUnstructured(0, appinsights.Error, format, v)
+	}
 	l.Close()
 	os.Exit(1)
 }
@@ -381,4 +513,55 @@ func Fatalf(format string, v ...interface{}) {
 	defaultLogger.output(sFatal, 0, fmt.Sprintf(format, v...))
 	defaultLogger.Close()
 	os.Exit(1)
+}
+
+func toLogLine(calldepth int, s string) string {
+	now := time.Now() // get this early.
+	var file string
+	var line int
+
+	var ok bool
+	_, file, line, ok = runtime.Caller(calldepth)
+	if !ok {
+		file = "???"
+		line = 0
+	}
+	return fmt.Sprintf("%s %s:%d: %s", now.String(), file, line, s)
+}
+
+func toString(value interface{}) string {
+	switch typedValue := value.(type) {
+	case string:
+		return typedValue
+	case int:
+		return strconv.Itoa(typedValue)
+	case float64:
+		return strconv.FormatFloat(typedValue, 'f', 6, 64)
+	default:
+		return fmt.Sprintf("%v", value)
+	}
+}
+
+func (l *Logger) emitUnstructured(depth int, severity contracts.SeverityLevel, format interface{}, vars ...interface{}) {
+	str := toString(format)
+	str = toLogLine(depth, str)
+	message := fmt.Sprintf(str, vars...)
+	trace := appinsights.NewTraceTelemetry(message, severity)
+	l.client.Track(trace)
+}
+
+func (l *Logger) emitStructured(depth int, severity contracts.SeverityLevel, message interface{}, vars ...interface{}) {
+	str := toString(message)
+	str = toLogLine(depth, str)
+	trace := appinsights.NewTraceTelemetry(str, severity)
+
+	// set properties
+	for varIdx := 0; varIdx < len(vars); varIdx += 2 {
+		key := toString(vars[varIdx])
+		value := toString(vars[varIdx+1])
+
+		trace.Properties[key] = value
+	}
+
+	l.client.Track(trace)
 }
