@@ -35,8 +35,6 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
-
-	"github.com/davecgh/go-spew/spew"
 )
 
 type severity int
@@ -206,7 +204,7 @@ func (l *Logger) RemoteConfig(conf RemoteConfig) {
 	if conf.MaxBatchInterval != 0 {
 		l.maxBatchInterval = conf.MaxBatchInterval
 	} else {
-		l.maxBatchInterval = 1 * time.Second
+		l.maxBatchInterval = 5 * time.Second
 	}
 	if conf.MaxBatchSize != 0 {
 		l.maxBatchSize = conf.MaxBatchSize
@@ -218,7 +216,7 @@ func (l *Logger) RemoteConfig(conf RemoteConfig) {
 	l.remoteLog = true
 }
 
-// Flush flushes buffered logs
+// Flush flushes queued logs
 func (l *Logger) Flush() {
 	if l.remoteLog {
 		l.postLogs()
@@ -229,16 +227,15 @@ func (l *Logger) Flush() {
 // Any errors from closing the underlying log writers will be printed to stderr.
 // Once Close is called, all future calls to the logger will panic.
 func (l *Logger) Close() {
+	if l.remoteLog {
+		l.Flush()
+	}
 	logLock.Lock()
 	defer logLock.Unlock()
 	for _, c := range l.closers {
 		if err := c.Close(); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to close log %v: %v\n", c, err)
 		}
-	}
-
-	if l.remoteLog {
-		l.Flush()
 	}
 }
 
@@ -571,13 +568,11 @@ func (l *Logger) postLogs() {
 	req.Header.Add("x-ms-date", dateString)
 	req.Header.Add("time-generated-field", timeStampField)
 
-	resp, _ := l.client.Do(req)
-	resp.Body.Close()
+	l.client.Do(req)
 	l.logQueue = []Log{}
 }
 
 func (l *Logger) emitLog(depth int, s severity, msg string) {
-	spew.Dump(msg)
 	log := toLog(depth, s, msg)
 	l.logQueue = append(l.logQueue, log)
 	if len(l.logQueue) > l.maxBatchSize || time.Since(l.lastBatchRun) > l.maxBatchInterval {

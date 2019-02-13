@@ -91,7 +91,6 @@ func TestRemoteLogging(t *testing.T) {
 
 	var buf1 bytes.Buffer
 	log := Init("testRemote", false, false, &buf1)
-	assert.Equal(log, defaultLogger)
 
 	id := os.Getenv("AZ_LOG_ID")
 	key := os.Getenv("AZ_LOG_KEY")
@@ -103,7 +102,7 @@ func TestRemoteLogging(t *testing.T) {
 	log.RemoteConfig(conf)
 
 	log.Infof("info: %v", 1)
-	assert.True(strings.Index(buf1.String(), "logger_test.go:105: info: 1") > -1)
+	assert.True(strings.Index(buf1.String(), "logger_test.go:104: info: 1") > -1)
 	log.Error("error")
 	log.Warning("warn")
 	log.Close()
