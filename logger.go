@@ -18,19 +18,25 @@ limitations under the License.
 package logger
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
-	"github.com/Microsoft/ApplicationInsights-Go/appinsights/contracts"
-
-	"github.com/Microsoft/ApplicationInsights-Go/appinsights"
+	"github.com/davecgh/go-spew/spew"
 )
 
 type severity int
@@ -45,10 +51,12 @@ const (
 
 // Severity tags.
 const (
-	tagInfo    = "INFO : "
-	tagWarning = "WARN : "
-	tagError   = "ERROR: "
-	tagFatal   = "FATAL: "
+	tagInfo        = "INFO : "
+	tagWarning     = "WARN : "
+	tagError       = "ERROR: "
+	tagFatal       = "FATAL: "
+	logType        = "GoLog"
+	timeStampField = "date"
 )
 
 const (
@@ -112,7 +120,12 @@ func Init(name string, verbose, systemLog bool, logFile io.Writer) *Logger {
 		wLogs = append(wLogs, os.Stdout)
 	}
 
+	if name == "" {
+		name = logType
+	}
+
 	l := Logger{
+		name:       name,
 		infoLog:    log.New(io.MultiWriter(iLogs...), tagInfo, flags),
 		warningLog: log.New(io.MultiWriter(wLogs...), tagWarning, flags),
 		errorLog:   log.New(io.MultiWriter(eLogs...), tagError, flags),
@@ -142,15 +155,21 @@ func New() *Logger {
 // A Logger represents an active logging object. Multiple loggers can be used
 // simultaneously even if they are using the same same writers.
 type Logger struct {
-	infoLog     *log.Logger
-	warningLog  *log.Logger
-	errorLog    *log.Logger
-	fatalLog    *log.Logger
-	closers     []io.Closer
-	client      appinsights.TelemetryClient
-	name        string
-	remoteLog   bool
-	initialized bool
+	name             string
+	infoLog          *log.Logger
+	warningLog       *log.Logger
+	errorLog         *log.Logger
+	fatalLog         *log.Logger
+	closers          []io.Closer
+	client           *http.Client
+	logQueue         []Log
+	accountId        string
+	key              string
+	maxBatchInterval time.Duration
+	maxBatchSize     int
+	lastBatchRun     time.Time
+	remoteLog        bool
+	initialized      bool
 }
 
 func (l *Logger) output(s severity, depth int, txt string) {
@@ -170,33 +189,39 @@ func (l *Logger) output(s severity, depth int, txt string) {
 	}
 }
 
-type Config struct {
+type RemoteConfig struct {
+	Name             string
+	AccountID        string
 	Key              string
 	MaxBatchInterval time.Duration
 	MaxBatchSize     int
 }
 
-func (l *Logger) Config(conf Config) {
-	telemetryClientConfig := appinsights.NewTelemetryConfiguration(conf.Key)
+func (l *Logger) RemoteConfig(conf RemoteConfig) {
+	l.accountId = conf.AccountID
+	l.key = conf.Key
+	if conf.Name != "" {
+		l.name = conf.Name
+	}
 	if conf.MaxBatchInterval != 0 {
-		telemetryClientConfig.MaxBatchInterval = conf.MaxBatchInterval
+		l.maxBatchInterval = conf.MaxBatchInterval
 	} else {
-		telemetryClientConfig.MaxBatchInterval = 1 * time.Second
+		l.maxBatchInterval = 1 * time.Second
 	}
 	if conf.MaxBatchSize != 0 {
-		telemetryClientConfig.MaxBatchSize = conf.MaxBatchSize
+		l.maxBatchSize = conf.MaxBatchSize
 	} else {
-		telemetryClientConfig.MaxBatchSize = 1024
+		l.maxBatchSize = 1024
 	}
-	telemetryClient := appinsights.NewTelemetryClientFromConfig(telemetryClientConfig)
-	l.client = telemetryClient
+	l.client = &http.Client{}
+	l.lastBatchRun = time.Now()
 	l.remoteLog = true
 }
 
 // Flush flushes buffered logs
 func (l *Logger) Flush() {
 	if l.remoteLog {
-		l.client.Channel().Flush()
+		l.postLogs()
 	}
 }
 
@@ -214,151 +239,136 @@ func (l *Logger) Close() {
 
 	if l.remoteLog {
 		l.Flush()
-		<-l.client.Channel().Close(10 * time.Second)
 	}
 }
 
 // Info logs with the Info severity.
 // Arguments are handled in the manner of fmt.Print.
 func (l *Logger) Info(v ...interface{}) {
-	l.output(sInfo, 0, fmt.Sprint(v...))
+	msg := fmt.Sprint(v...)
+	l.output(sInfo, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Information, v)
+		l.emitLog(0, sInfo, msg)
 	}
 }
 
 // InfoDepth acts as Info but uses depth to determine which call frame to log.
 // InfoDepth(0, "msg") is the same as Info("msg").
 func (l *Logger) InfoDepth(depth int, v ...interface{}) {
-	l.output(sInfo, depth, fmt.Sprint(v...))
+	msg := fmt.Sprint(v...)
+	l.output(sInfo, depth, msg)
 	if l.remoteLog {
-		l.emitUnstructured(depth, appinsights.Information, v)
+		l.emitLog(depth, sInfo, msg)
 	}
 }
 
 // Infoln logs with the Info severity.
 // Arguments are handled in the manner of fmt.Println.
 func (l *Logger) Infoln(v ...interface{}) {
-	l.output(sInfo, 0, fmt.Sprintln(v...))
+	msg := fmt.Sprintln(v...)
+	l.output(sInfo, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Information, v)
+		l.emitLog(0, sInfo, msg)
 	}
 }
 
 // Infof logs with the Info severity.
 // Arguments are handled in the manner of fmt.Printf.
 func (l *Logger) Infof(format string, v ...interface{}) {
-	l.output(sInfo, 0, fmt.Sprintf(format, v...))
+	msg := fmt.Sprintf(format, v...)
+	l.output(sInfo, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Information, format, v)
-	}
-}
-
-// InfoWith logs with the Info severity.
-// Arguments are handled as structured key val pairs.
-func (l *Logger) InfoWith(format string, v ...interface{}) {
-	l.output(sInfo, 0, fmt.Sprintf(format, v...))
-	if l.remoteLog {
-		l.emitStructured(0, appinsights.Information, format, v)
+		l.emitLog(0, sInfo, msg)
 	}
 }
 
 // Warning logs with the Warning severity.
 // Arguments are handled in the manner of fmt.Print.
 func (l *Logger) Warning(v ...interface{}) {
-	l.output(sWarning, 0, fmt.Sprint(v...))
+	msg := fmt.Sprint(v...)
+	l.output(sWarning, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Warning, v)
+		l.emitLog(0, sWarning, msg)
 	}
 }
 
 // WarningDepth acts as Warning but uses depth to determine which call frame to log.
 // WarningDepth(0, "msg") is the same as Warning("msg").
 func (l *Logger) WarningDepth(depth int, v ...interface{}) {
-	l.output(sWarning, depth, fmt.Sprint(v...))
+	msg := fmt.Sprint(v...)
+	l.output(sWarning, depth, msg)
 	if l.remoteLog {
-		l.emitUnstructured(depth, appinsights.Warning, v)
+		l.emitLog(depth, sWarning, msg)
 	}
 }
 
 // Warningln logs with the Warning severity.
 // Arguments are handled in the manner of fmt.Println.
 func (l *Logger) Warningln(v ...interface{}) {
-	l.output(sWarning, 0, fmt.Sprintln(v...))
+	msg := fmt.Sprintln(v...)
+	l.output(sWarning, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Warning, v)
+		l.emitLog(0, sWarning, msg)
 	}
 }
 
 // Warningf logs with the Warning severity.
 // Arguments are handled in the manner of fmt.Printf.
 func (l *Logger) Warningf(format string, v ...interface{}) {
-	l.output(sWarning, 0, fmt.Sprintf(format, v...))
+	msg := fmt.Sprintf(format, v...)
+	l.output(sWarning, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Warning, format, v)
-	}
-}
-
-// WarningWith logs with the Warning severity.
-// Arguments are handled as structured key val pairs.
-func (l *Logger) WarningWith(format string, v ...interface{}) {
-	l.output(sWarning, 0, fmt.Sprintf(format, v...))
-	if l.remoteLog {
-		l.emitStructured(0, appinsights.Warning, format, v)
+		l.emitLog(0, sWarning, msg)
 	}
 }
 
 // Error logs with the ERROR severity.
 // Arguments are handled in the manner of fmt.Print.
 func (l *Logger) Error(v ...interface{}) {
-	l.output(sError, 0, fmt.Sprint(v...))
+	msg := fmt.Sprint(v...)
+	l.output(sError, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Error, v)
+		l.emitLog(0, sError, msg)
 	}
 }
 
 // ErrorDepth acts as Error but uses depth to determine which call frame to log.
 // ErrorDepth(0, "msg") is the same as Error("msg").
 func (l *Logger) ErrorDepth(depth int, v ...interface{}) {
-	l.output(sError, depth, fmt.Sprint(v...))
+	msg := fmt.Sprint(v...)
+	l.output(sError, depth, msg)
 	if l.remoteLog {
-		l.emitUnstructured(depth, appinsights.Error, v)
+		l.emitLog(depth, sError, msg)
 	}
 }
 
 // Errorln logs with the ERROR severity.
 // Arguments are handled in the manner of fmt.Println.
 func (l *Logger) Errorln(v ...interface{}) {
-	l.output(sError, 0, fmt.Sprintln(v...))
+	msg := fmt.Sprintln(v...)
+	l.output(sError, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Error, v)
+		l.emitLog(0, sError, msg)
 	}
 }
 
 // Errorf logs with the Error severity.
 // Arguments are handled in the manner of fmt.Printf.
 func (l *Logger) Errorf(format string, v ...interface{}) {
-	l.output(sError, 0, fmt.Sprintf(format, v...))
+	msg := fmt.Sprintf(format, v...)
+	l.output(sError, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Error, format, v)
-	}
-}
-
-// ErrorWith logs with the Error severity.
-// Arguments are handled as structured key val pairs.
-func (l *Logger) ErrorWith(format string, v ...interface{}) {
-	l.output(sError, 0, fmt.Sprintf(format, v...))
-	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Error, format, v)
+		l.emitLog(0, sError, msg)
 	}
 }
 
 // Fatal logs with the Fatal severity, and ends with os.Exit(1).
 // Arguments are handled in the manner of fmt.Print.
 func (l *Logger) Fatal(v ...interface{}) {
-	l.output(sFatal, 0, fmt.Sprint(v...))
+	msg := fmt.Sprint(v...)
+	l.output(sFatal, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Error, v)
+		l.emitLog(0, sFatal, msg)
 	}
 	l.Close()
 	os.Exit(1)
@@ -367,9 +377,10 @@ func (l *Logger) Fatal(v ...interface{}) {
 // FatalDepth acts as Fatal but uses depth to determine which call frame to log.
 // FatalDepth(0, "msg") is the same as Fatal("msg").
 func (l *Logger) FatalDepth(depth int, v ...interface{}) {
-	l.output(sFatal, depth, fmt.Sprint(v...))
+	msg := fmt.Sprint(v...)
+	l.output(sFatal, depth, msg)
 	if l.remoteLog {
-		l.emitUnstructured(depth, appinsights.Error, v)
+		l.emitLog(depth, sFatal, msg)
 	}
 	l.Close()
 	os.Exit(1)
@@ -378,9 +389,10 @@ func (l *Logger) FatalDepth(depth int, v ...interface{}) {
 // Fatalln logs with the Fatal severity, and ends with os.Exit(1).
 // Arguments are handled in the manner of fmt.Println.
 func (l *Logger) Fatalln(v ...interface{}) {
-	l.output(sFatal, 0, fmt.Sprintln(v...))
+	msg := fmt.Sprintln(v...)
+	l.output(sFatal, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Error, v)
+		l.emitLog(0, sFatal, msg)
 	}
 	l.Close()
 	os.Exit(1)
@@ -389,20 +401,10 @@ func (l *Logger) Fatalln(v ...interface{}) {
 // Fatalf logs with the Fatal severity, and ends with os.Exit(1).
 // Arguments are handled in the manner of fmt.Printf.
 func (l *Logger) Fatalf(format string, v ...interface{}) {
-	l.output(sFatal, 0, fmt.Sprintf(format, v...))
+	msg := fmt.Sprintf(format, v...)
+	l.output(sFatal, 0, msg)
 	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Error, format, v)
-	}
-	l.Close()
-	os.Exit(1)
-}
-
-// FatalWith logs with the Fatal severity, and ends with os.Exit(1).
-// Arguments are handled as structured key val pairs.
-func (l *Logger) FatalWith(format string, v ...interface{}) {
-	l.output(sFatal, 0, fmt.Sprintf(format, v...))
-	if l.remoteLog {
-		l.emitUnstructured(0, appinsights.Error, format, v)
+		l.emitLog(0, sError, msg)
 	}
 	l.Close()
 	os.Exit(1)
@@ -515,53 +517,71 @@ func Fatalf(format string, v ...interface{}) {
 	os.Exit(1)
 }
 
-func toLogLine(calldepth int, s string) string {
+func buildSignature(message, secret string) string {
+	keyBytes, _ := base64.StdEncoding.DecodeString(secret)
+	mac := hmac.New(sha256.New, keyBytes)
+	mac.Write([]byte(message))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+type Log struct {
+	Date    time.Time `json:"date"`
+	Level   severity  `json:"level"`
+	File    string    `json:"file"`
+	Line    int       `json:"line"`
+	Message string    `json:"message"`
+}
+
+func toLog(depth int, level severity, msg string) Log {
 	now := time.Now() // get this early.
 	var file string
 	var line int
 
 	var ok bool
-	_, file, line, ok = runtime.Caller(calldepth)
+	_, file, line, ok = runtime.Caller(depth)
 	if !ok {
 		file = "???"
 		line = 0
 	}
-	return fmt.Sprintf("%s %s:%d: %s", now.String(), file, line, s)
-}
 
-func toString(value interface{}) string {
-	switch typedValue := value.(type) {
-	case string:
-		return typedValue
-	case int:
-		return strconv.Itoa(typedValue)
-	case float64:
-		return strconv.FormatFloat(typedValue, 'f', 6, 64)
-	default:
-		return fmt.Sprintf("%v", value)
-	}
-}
-
-func (l *Logger) emitUnstructured(depth int, severity contracts.SeverityLevel, format interface{}, vars ...interface{}) {
-	str := toString(format)
-	str = toLogLine(depth, str)
-	message := fmt.Sprintf(str, vars...)
-	trace := appinsights.NewTraceTelemetry(message, severity)
-	l.client.Track(trace)
-}
-
-func (l *Logger) emitStructured(depth int, severity contracts.SeverityLevel, message interface{}, vars ...interface{}) {
-	str := toString(message)
-	str = toLogLine(depth, str)
-	trace := appinsights.NewTraceTelemetry(str, severity)
-
-	// set properties
-	for varIdx := 0; varIdx < len(vars); varIdx += 2 {
-		key := toString(vars[varIdx])
-		value := toString(vars[varIdx+1])
-
-		trace.Properties[key] = value
+	ll := Log{
+		Date:    now,
+		Level:   level,
+		File:    file,
+		Line:    line,
+		Message: msg,
 	}
 
-	l.client.Track(trace)
+	return ll
+}
+
+func (l *Logger) postLogs() {
+	dateString := time.Now().UTC().Format(time.RFC1123)
+	dateString = strings.Replace(dateString, "UTC", "GMT", -1)
+	data, _ := json.Marshal(l.logQueue)
+	stringToHash := "POST\n" + strconv.Itoa(utf8.RuneCountInString(string(data))) + "\napplication/json\n" + "x-ms-date:" + dateString + "\n/api/logs"
+	hashedString := buildSignature(stringToHash, l.key)
+	signature := "SharedKey " + l.accountId + ":" + hashedString
+	url := "https://" + l.accountId + ".ods.opinsights.azure.com/api/logs?api-version=2016-04-01"
+
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(data))
+	req.Header.Add("Log-Type", l.name)
+	req.Header.Add("Authorization", signature)
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("x-ms-date", dateString)
+	req.Header.Add("time-generated-field", timeStampField)
+
+	resp, _ := l.client.Do(req)
+	resp.Body.Close()
+	l.logQueue = []Log{}
+}
+
+func (l *Logger) emitLog(depth int, s severity, msg string) {
+	spew.Dump(msg)
+	log := toLog(depth, s, msg)
+	l.logQueue = append(l.logQueue, log)
+	if len(l.logQueue) > l.maxBatchSize || time.Since(l.lastBatchRun) > l.maxBatchInterval {
+		l.postLogs()
+		l.lastBatchRun = time.Now()
+	}
 }

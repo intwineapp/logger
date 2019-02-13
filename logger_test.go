@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestLoggingBeforeInit(t *testing.T) {
@@ -82,4 +84,27 @@ func TestInit(t *testing.T) {
 			t.Errorf("logger %d wrong number of lines, want %d, got %d", i+1, tt.want, got)
 		}
 	}
+}
+
+func TestRemoteLogging(t *testing.T) {
+	assert := assert.New(t)
+
+	var buf1 bytes.Buffer
+	log := Init("testRemote", false, false, &buf1)
+	assert.Equal(log, defaultLogger)
+
+	id := os.Getenv("AZ_LOG_ID")
+	key := os.Getenv("AZ_LOG_KEY")
+	conf := RemoteConfig{
+		Name:      "testing",
+		AccountID: id,
+		Key:       key,
+	}
+	log.RemoteConfig(conf)
+
+	log.Infof("info: %v", 1)
+	assert.True(strings.Index(buf1.String(), "logger_test.go:105: info: 1") > -1)
+	log.Error("error")
+	log.Warning("warn")
+	log.Close()
 }
